@@ -8,7 +8,8 @@ const CONFIG = {
   DRIVE_UPLOAD: 'https://www.googleapis.com/upload/drive/v3',
   FOLDER_NAME: 'SplitPay',
   DATA_FILE: 'splitpay-data.json',
-  PROXY_URL: 'https://splitpay.ckh892006.workers.dev',
+  // Cloudflare Worker URL — Gemini key is stored as Worker secret, never exposed here
+  WORKER_URL: 'https://splitpay.ckh892006.workers.dev',
 };
 
 // ============================================================
@@ -366,62 +367,39 @@ function matchCategory(raw) {
 async function scanReceipt(b64) {
   state.scanning = true;
   renderScannerPanel();
+
+  if (!CONFIG.WORKER_URL || CONFIG.WORKER_URL === 'REPLACE_WITH_WORKER_URL') {
+    state.scanResult = { error: true, workerNotSet: true, name: '', total: 0, category: '🍽️ Food', items: [] };
+    state.scanning = false;
+    renderScannerPanel();
+    return;
+  }
+
   try {
-    // Compress image first
+    // Compress image before sending to reduce size
     const compressed = await compressImage(b64);
 
-    const resp = await fetch(CONFIG.PROXY_URL, {
+    // Send ONLY the image to the Worker — Gemini API key stays in Worker secret
+    const resp = await fetch(CONFIG.WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1200,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: 'image/jpeg', data: compressed }
-            },
-            {
-              type: 'text',
-              text: `You are a receipt scanner. Carefully read this receipt image and extract ALL visible information.
-
-Extract:
-1. Store/restaurant name (look for header text at top)
-2. Grand total amount — look for "TOTAL", "GRAND TOTAL", "JUMLAH", "Amount Due" — use the FINAL total after tax, NOT subtotal
-3. Category — MUST be exactly one of: Food, Transport, Hotel, Shopping, Entertainment, Health, Utilities, Other
-   - Nasi lemak, kopi, makan, restaurant, cafe, hawker = Food
-   - Grab, taxi, parking, petrol = Transport
-   - Hotel, resort, airbnb = Hotel
-4. Date if visible (YYYY-MM-DD format)
-5. All line items with their prices
-
-Rules:
-- If you see "Subtotal: 31.70" and "Service charge: 1.90" and "Total: 33.60" — use 33.60
-- Category: when in doubt between Food and Other, choose Food
-- All prices in MYR unless currency symbol shows otherwise
-
-Respond ONLY with this exact JSON format, no markdown, no explanation:
-{"name":"store name here","total":0.00,"currency":"MYR","category":"Food","date":"","items":[{"desc":"item name","price":0.00}]}`
-            }
-          ]
-        }]
-      })
+        imageBase64: compressed,
+        mimeType: 'image/jpeg',
+      }),
     });
 
     if (!resp.ok) {
-      const errText = await resp.text();
-      console.error('Proxy error:', resp.status, errText);
-      throw new Error('Proxy returned ' + resp.status);
+      const errData = await resp.json().catch(() => ({}));
+      console.error('Worker error:', resp.status, errData);
+      throw new Error(errData.error || 'Worker returned ' + resp.status);
     }
 
     const data = await resp.json();
-    const text = data.content?.find(c => c.type === 'text')?.text || '{}';
-    const clean = text.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
+    const text = (data.result || '{}').replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(text);
 
-    // Fix category using our robust matcher
+    // Robust category matching
     parsed.category = matchCategory(parsed.category);
     state.scanResult = parsed;
 
@@ -529,7 +507,7 @@ function buildScanResultForm() {
   const catVal = CATS.includes(r.category) ? r.category : CATS[0];
 
   let html = '';
-  if (r.error) html += '<div class="notice warn" style="margin-bottom:10px">Could not read receipt automatically. Fill in manually below.</div>';
+  if (r.error) html += `<div class="notice warn" style="margin-bottom:10px">${r.workerNotSet ? "Worker URL not configured yet. Fill in manually below." : "Could not read receipt. Please fill in manually below."}</div>`;
 
   if (state.scanImagePreview) {
     html += `<img src="${state.scanImagePreview}" style="width:100%;height:120px;object-fit:cover;border-radius:8px;margin-bottom:10px;border:0.5px solid rgba(0,0,0,0.08)">`;
