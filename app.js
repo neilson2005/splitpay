@@ -8,7 +8,7 @@ const CONFIG = {
   DRIVE_UPLOAD: 'https://www.googleapis.com/upload/drive/v3',
   FOLDER_NAME: 'SplitPay',
   DATA_FILE: 'splitpay-data.json',
-  PROXY_URL: 'REPLACE_WITH_WORKER_URL',
+  PROXY_URL: 'https://splitpay.ckh892006.workers.dev',
 };
 
 // ============================================================
