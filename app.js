@@ -8,7 +8,7 @@ const CONFIG = {
   DRIVE_UPLOAD: 'https://www.googleapis.com/upload/drive/v3',
   FOLDER_NAME: 'SplitPay',
   DATA_FILE: 'splitpay-data.json',
-  ANTHROPIC_API: 'https://api.anthropic.com/v1/messages',
+  PROXY_URL: 'REPLACE_WITH_WORKER_URL',
 };
 
 // ============================================================
@@ -313,30 +313,121 @@ function computeSettlements() {
 // ============================================================
 // AI Receipt Scan
 // ============================================================
+
+// Compress image before sending — reduces size and improves reliability
+function compressImage(b64, maxWidth = 1200, quality = 0.82) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let w = img.width, h = img.height;
+      if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      const compressed = canvas.toDataURL('image/jpeg', quality).split(',')[1];
+      resolve(compressed);
+    };
+    img.onerror = () => resolve(b64); // fallback to original
+    img.src = 'data:image/jpeg;base64,' + b64;
+  });
+}
+
+// Map AI category response to our CATS list
+function matchCategory(raw) {
+  if (!raw) return CATS[0]; // default Food
+  const r = raw.toLowerCase().trim();
+  const map = {
+    'food': '🍽️ Food', 'drink': '🍽️ Food', 'restaurant': '🍽️ Food',
+    'cafe': '🍽️ Food', 'coffee': '🍽️ Food', 'meal': '🍽️ Food',
+    'grocery': '🍽️ Food', 'groceries': '🍽️ Food',
+    'transport': '🚕 Transport', 'taxi': '🚕 Transport', 'grab': '🚕 Transport',
+    'uber': '🚕 Transport', 'bus': '🚕 Transport', 'train': '🚕 Transport',
+    'flight': '🚕 Transport', 'petrol': '🚕 Transport', 'fuel': '🚕 Transport',
+    'hotel': '🏨 Hotel', 'accommodation': '🏨 Hotel', 'airbnb': '🏨 Hotel',
+    'hostel': '🏨 Hotel', 'motel': '🏨 Hotel',
+    'shopping': '🛍️ Shopping', 'retail': '🛍️ Shopping', 'clothes': '🛍️ Shopping',
+    'entertainment': '🎭 Entertainment', 'movie': '🎭 Entertainment',
+    'cinema': '🎭 Entertainment', 'ticket': '🎭 Entertainment',
+    'health': '💊 Health', 'pharmacy': '💊 Health', 'medical': '💊 Health',
+    'clinic': '💊 Health', 'hospital': '💊 Health',
+    'utilities': '⚡ Utilities', 'electric': '⚡ Utilities', 'water': '⚡ Utilities',
+    'internet': '⚡ Utilities', 'phone': '⚡ Utilities',
+  };
+  // Direct key match
+  if (map[r]) return map[r];
+  // Partial match
+  for (const [key, val] of Object.entries(map)) {
+    if (r.includes(key)) return val;
+  }
+  return CATS[0]; // default to Food (most common for group trips)
+}
+
 async function scanReceipt(b64) {
   state.scanning = true;
   renderScannerPanel();
   try {
-    const resp = await fetch(CONFIG.ANTHROPIC_API, {
+    // Compress image first
+    const compressed = await compressImage(b64);
+
+    const resp = await fetch(CONFIG.PROXY_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
+        max_tokens: 1200,
         messages: [{
           role: 'user',
           content: [
-            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
-            { type: 'text', text: `Analyze this receipt. Extract: store name, total amount (number only), currency (default MYR), category (Food/Transport/Hotel/Shopping/Entertainment/Health/Utilities/Other), date if visible, line items (name + price each). Respond ONLY with valid JSON no markdown: {"name":"","total":0,"currency":"MYR","category":"Food","date":"","items":[{"desc":"","price":0}],"confidence":"high"}` }
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: 'image/jpeg', data: compressed }
+            },
+            {
+              type: 'text',
+              text: `You are a receipt scanner. Carefully read this receipt image and extract ALL visible information.
+
+Extract:
+1. Store/restaurant name (look for header text at top)
+2. Grand total amount — look for "TOTAL", "GRAND TOTAL", "JUMLAH", "Amount Due" — use the FINAL total after tax, NOT subtotal
+3. Category — MUST be exactly one of: Food, Transport, Hotel, Shopping, Entertainment, Health, Utilities, Other
+   - Nasi lemak, kopi, makan, restaurant, cafe, hawker = Food
+   - Grab, taxi, parking, petrol = Transport
+   - Hotel, resort, airbnb = Hotel
+4. Date if visible (YYYY-MM-DD format)
+5. All line items with their prices
+
+Rules:
+- If you see "Subtotal: 31.70" and "Service charge: 1.90" and "Total: 33.60" — use 33.60
+- Category: when in doubt between Food and Other, choose Food
+- All prices in MYR unless currency symbol shows otherwise
+
+Respond ONLY with this exact JSON format, no markdown, no explanation:
+{"name":"store name here","total":0.00,"currency":"MYR","category":"Food","date":"","items":[{"desc":"item name","price":0.00}]}`
+            }
           ]
         }]
       })
     });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error('Proxy error:', resp.status, errText);
+      throw new Error('Proxy returned ' + resp.status);
+    }
+
     const data = await resp.json();
     const text = data.content?.find(c => c.type === 'text')?.text || '{}';
-    state.scanResult = JSON.parse(text.replace(/```json|```/g, '').trim());
+    const clean = text.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(clean);
+
+    // Fix category using our robust matcher
+    parsed.category = matchCategory(parsed.category);
+    state.scanResult = parsed;
+
   } catch (e) {
-    state.scanResult = { error: true, name: '', total: 0, category: 'Other', items: [] };
+    console.error('Scan error:', e);
+    state.scanResult = { error: true, name: '', total: 0, category: '🍽️ Food', items: [] };
   }
   state.scanning = false;
   renderScannerPanel();
@@ -434,7 +525,8 @@ function buildScanResultForm() {
   if (!state.members.length) return '<div class="notice warn">Add members first before scanning.</div>';
 
   const memberOpts = state.members.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
-  const catVal = CATS.find(c => c.toLowerCase().includes((r.category || '').toLowerCase())) || CATS[0];
+  // r.category is already a full CATS string like "🍽️ Food" from matchCategory()
+  const catVal = CATS.includes(r.category) ? r.category : CATS[0];
 
   let html = '';
   if (r.error) html += '<div class="notice warn" style="margin-bottom:10px">Could not read receipt automatically. Fill in manually below.</div>';
