@@ -1,0 +1,783 @@
+// ============================================================
+// SplitPay — config
+// ============================================================
+const CONFIG = {
+  CLIENT_ID: '679676657560-epd881626nfnfar7f1l52sc316d7oqop.apps.googleusercontent.com',
+  SCOPES: 'https://www.googleapis.com/auth/drive.file openid profile email',
+  DRIVE_API: 'https://www.googleapis.com/drive/v3',
+  DRIVE_UPLOAD: 'https://www.googleapis.com/upload/drive/v3',
+  FOLDER_NAME: 'SplitPay',
+  DATA_FILE: 'splitpay-data.json',
+  ANTHROPIC_API: 'https://api.anthropic.com/v1/messages',
+};
+
+// ============================================================
+// State
+// ============================================================
+let state = {
+  token: null,
+  user: null,
+  folderId: null,
+  dataFileId: null,
+  groupName: 'Trip Expenses',
+  members: [],
+  expenses: [],
+  receiptFileIds: {}, // expenseId -> driveFileId
+  scanResult: null,
+  scanImageB64: null,
+  scanImagePreview: null,
+  scanning: false,
+  syncing: false,
+};
+
+// ============================================================
+// Avatar colors
+// ============================================================
+const AV_COLORS = [
+  { bg: '#E1F5EE', color: '#0F6E56' },
+  { bg: '#E6F1FB', color: '#185FA5' },
+  { bg: '#FAEEDA', color: '#854F0B' },
+  { bg: '#FAECE7', color: '#993C1D' },
+  { bg: '#FBEAF0', color: '#993556' },
+  { bg: '#EAF3DE', color: '#3B6D11' },
+  { bg: '#FCEBEB', color: '#A32D2D' },
+];
+const CATS = ['🍽️ Food','🚕 Transport','🏨 Hotel','🛍️ Shopping','🎭 Entertainment','💊 Health','⚡ Utilities','📦 Other'];
+
+function avatarColor(name) {
+  const i = Math.abs((name || '').split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % AV_COLORS.length;
+  return AV_COLORS[i];
+}
+function initials(name) {
+  return (name || '?').trim().split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+}
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+function fmtMoney(v) { return 'RM ' + Math.abs(parseFloat(v) || 0).toFixed(2); }
+function fmtDate(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleDateString('en-MY', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// ============================================================
+// Google Sign-In
+// ============================================================
+function initGoogle() {
+  if (typeof google === 'undefined') {
+    setTimeout(initGoogle, 300);
+    return;
+  }
+  google.accounts.id.initialize({
+    client_id: CONFIG.CLIENT_ID,
+    callback: handleCredential,
+    auto_select: false,
+  });
+
+  document.getElementById('signin-btn').addEventListener('click', () => {
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: CONFIG.CLIENT_ID,
+      scope: CONFIG.SCOPES,
+      callback: handleToken,
+    });
+    client.requestAccessToken();
+  });
+}
+
+function handleToken(resp) {
+  if (resp.error) { alert('Sign-in failed: ' + resp.error); return; }
+  state.token = resp.access_token;
+  fetchUserInfo().then(() => {
+    showApp();
+    initDriveFolder();
+  });
+}
+
+async function fetchUserInfo() {
+  const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: 'Bearer ' + state.token }
+  });
+  state.user = await r.json();
+  const av = document.getElementById('user-avatar');
+  if (state.user.picture) {
+    av.innerHTML = `<img src="${state.user.picture}" alt="avatar">`;
+  } else {
+    av.textContent = initials(state.user.name || state.user.email || 'U');
+  }
+}
+
+function signOut() {
+  state.token = null;
+  state.user = null;
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('auth-screen').classList.remove('hidden');
+}
+
+// ============================================================
+// Google Drive — folder & data file management
+// ============================================================
+async function driveGet(url, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const r = await fetch(`${CONFIG.DRIVE_API}${url}${qs ? '?' + qs : ''}`, {
+    headers: { Authorization: 'Bearer ' + state.token }
+  });
+  return r.json();
+}
+
+async function initDriveFolder() {
+  showSync('Connecting to Google Drive...');
+  try {
+    // Find or create SplitPay folder
+    const list = await driveGet('/files', {
+      q: `name='${CONFIG.FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id,name)',
+    });
+    if (list.files && list.files.length > 0) {
+      state.folderId = list.files[0].id;
+    } else {
+      const r = await fetch(`${CONFIG.DRIVE_API}/files`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: CONFIG.FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }),
+      });
+      const f = await r.json();
+      state.folderId = f.id;
+    }
+
+    // Find or load data file
+    const dlist = await driveGet('/files', {
+      q: `name='${CONFIG.DATA_FILE}' and '${state.folderId}' in parents and trashed=false`,
+      fields: 'files(id,name)',
+    });
+    if (dlist.files && dlist.files.length > 0) {
+      state.dataFileId = dlist.files[0].id;
+      await loadDataFromDrive();
+    } else {
+      await saveDataToDrive();
+    }
+    hideSync();
+    renderAll();
+  } catch (e) {
+    hideSync();
+    console.error('Drive init error', e);
+    renderAll();
+  }
+}
+
+async function loadDataFromDrive() {
+  if (!state.dataFileId) return;
+  try {
+    const r = await fetch(`${CONFIG.DRIVE_API}/files/${state.dataFileId}?alt=media`, {
+      headers: { Authorization: 'Bearer ' + state.token }
+    });
+    const data = await r.json();
+    if (data.groupName) state.groupName = data.groupName;
+    if (data.members) state.members = data.members;
+    if (data.expenses) state.expenses = data.expenses;
+    if (data.receiptFileIds) state.receiptFileIds = data.receiptFileIds;
+    // update group name display
+    document.getElementById('group-name-display').textContent = state.groupName;
+  } catch (e) { console.error('Load error', e); }
+}
+
+async function saveDataToDrive() {
+  if (!state.folderId) return;
+  showSync('Saving to Google Drive...');
+  const payload = JSON.stringify({
+    groupName: state.groupName,
+    members: state.members,
+    expenses: state.expenses,
+    receiptFileIds: state.receiptFileIds,
+  });
+  try {
+    if (state.dataFileId) {
+      await fetch(`${CONFIG.DRIVE_UPLOAD}/files/${state.dataFileId}?uploadType=media`, {
+        method: 'PATCH',
+        headers: { Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/json' },
+        body: payload,
+      });
+    } else {
+      const meta = { name: CONFIG.DATA_FILE, parents: [state.folderId], mimeType: 'application/json' };
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+      form.append('file', new Blob([payload], { type: 'application/json' }));
+      const r = await fetch(`${CONFIG.DRIVE_UPLOAD}/files?uploadType=multipart`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + state.token },
+        body: form,
+      });
+      const f = await r.json();
+      state.dataFileId = f.id;
+    }
+  } catch (e) { console.error('Save error', e); }
+  hideSync();
+}
+
+async function uploadReceiptToDrive(expenseId, base64img) {
+  if (!state.folderId) return null;
+  showSync('Uploading receipt to Google Drive...');
+  try {
+    const binary = atob(base64img);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'image/jpeg' });
+
+    const meta = { name: `receipt_${expenseId}.jpg`, parents: [state.folderId] };
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+    form.append('file', blob);
+
+    const r = await fetch(`${CONFIG.DRIVE_UPLOAD}/files?uploadType=multipart`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + state.token },
+      body: form,
+    });
+    const f = await r.json();
+    hideSync();
+    return f.id;
+  } catch (e) {
+    hideSync();
+    console.error('Receipt upload error', e);
+    return null;
+  }
+}
+
+async function getReceiptUrl(fileId) {
+  // Return a Drive thumbnail/download URL using the token
+  return `${CONFIG.DRIVE_API}/files/${fileId}?alt=media&access_token=${state.token}`;
+}
+
+// ============================================================
+// Finance logic
+// ============================================================
+function computeBalances() {
+  const bal = {};
+  state.members.forEach(m => bal[m.id] = 0);
+  state.expenses.forEach(exp => {
+    const splits = exp.splits || {};
+    Object.entries(splits).forEach(([uid, amt]) => {
+      if (uid !== exp.paidBy) {
+        if (bal[exp.paidBy] !== undefined) bal[exp.paidBy] += parseFloat(amt) || 0;
+        if (bal[uid] !== undefined) bal[uid] -= parseFloat(amt) || 0;
+      }
+    });
+  });
+  return bal;
+}
+
+function computeSettlements() {
+  const bal = computeBalances();
+  const pos = [], neg = [];
+  Object.entries(bal).forEach(([id, v]) => {
+    const m = state.members.find(x => x.id === id);
+    if (!m) return;
+    if (v > 0.005) pos.push({ id, name: m.name, amt: v });
+    else if (v < -0.005) neg.push({ id, name: m.name, amt: Math.abs(v) });
+  });
+  const txns = [];
+  const p = [...pos.sort((a, b) => b.amt - a.amt)];
+  const n = [...neg.sort((a, b) => b.amt - a.amt)];
+  let pi = 0, ni = 0;
+  while (pi < p.length && ni < n.length) {
+    const pay = Math.min(p[pi].amt, n[ni].amt);
+    txns.push({ from: n[ni].name, to: p[pi].name, fromId: n[ni].id, toId: p[pi].id, amt: pay });
+    p[pi].amt -= pay; n[ni].amt -= pay;
+    if (p[pi].amt < 0.005) pi++;
+    if (n[ni].amt < 0.005) ni++;
+  }
+  return txns;
+}
+
+// ============================================================
+// AI Receipt Scan
+// ============================================================
+async function scanReceipt(b64) {
+  state.scanning = true;
+  renderScannerPanel();
+  try {
+    const resp = await fetch(CONFIG.ANTHROPIC_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+            { type: 'text', text: `Analyze this receipt. Extract: store name, total amount (number only), currency (default MYR), category (Food/Transport/Hotel/Shopping/Entertainment/Health/Utilities/Other), date if visible, line items (name + price each). Respond ONLY with valid JSON no markdown: {"name":"","total":0,"currency":"MYR","category":"Food","date":"","items":[{"desc":"","price":0}],"confidence":"high"}` }
+          ]
+        }]
+      })
+    });
+    const data = await resp.json();
+    const text = data.content?.find(c => c.type === 'text')?.text || '{}';
+    state.scanResult = JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    state.scanResult = { error: true, name: '', total: 0, category: 'Other', items: [] };
+  }
+  state.scanning = false;
+  renderScannerPanel();
+}
+
+// ============================================================
+// Render — full UI
+// ============================================================
+function renderAll() {
+  renderStats();
+  renderExpenses();
+  renderSettle();
+  renderMembers();
+  document.getElementById('group-name-display').textContent = state.groupName;
+}
+
+function renderStats() {
+  const totalSpent = state.expenses.filter(e => !e.isSettlement).reduce((s, e) => s + parseFloat(e.amount || 0), 0);
+  const receiptCount = Object.keys(state.receiptFileIds).length;
+  const settlements = computeSettlements();
+  document.getElementById('stat-total').textContent = 'RM ' + totalSpent.toFixed(2);
+  document.getElementById('stat-count').textContent = state.expenses.filter(e => !e.isSettlement).length;
+  document.getElementById('stat-receipts').textContent = receiptCount;
+  document.getElementById('stat-settle').textContent = settlements.length;
+}
+
+// ===== Expenses Tab =====
+function renderExpenses() {
+  const list = document.getElementById('expense-list');
+  if (state.expenses.length === 0) {
+    list.innerHTML = '<div class="empty-state">No expenses yet.<br>Scan a receipt or add manually.</div>';
+    return;
+  }
+  list.innerHTML = state.expenses.map(e => buildExpenseRow(e)).join('');
+}
+
+function buildExpenseRow(e) {
+  const payer = state.members.find(m => m.id === e.paidBy);
+  const av = payer ? avatarColor(payer.name) : { bg: '#eee', color: '#999' };
+  const splits = e.splits || {};
+  const splitees = Object.keys(splits).filter(id => id !== e.paidBy);
+  const hasReceipt = !!state.receiptFileIds[e.id];
+  const perPerson = splitees.length ? (parseFloat(e.amount || 0) / (splitees.length + 1)).toFixed(2) : null;
+
+  return `<div class="expense-row">
+    <div class="avatar" style="background:${av.bg};color:${av.color}">${payer ? initials(payer.name) : '?'}</div>
+    <div class="expense-meta">
+      <div class="expense-desc">
+        <span>${e.desc || 'Expense'}</span>
+        ${e.isSettlement ? '<span class="pill pill-gray">settlement</span>' : ''}
+        ${hasReceipt ? `<span class="pill pill-blue" onclick="viewReceipt('${e.id}')">📎 receipt</span>` : ''}
+        ${e.items && e.items.length ? '<span class="ai-badge">AI scanned</span>' : ''}
+      </div>
+      <div class="expense-sub">${e.category || ''} · paid by <b>${payer ? payer.name : 'Unknown'}</b> · ${fmtDate(e.date)}</div>
+      ${splitees.length && !e.isSettlement ? `<div class="expense-split">Split: ${splitees.map(id => { const m = state.members.find(x => x.id === id); return m ? m.name : '?'; }).join(', ')}</div>` : ''}
+    </div>
+    <div class="expense-amount">
+      <div class="amount-val">${fmtMoney(e.amount)}</div>
+      ${perPerson && !e.isSettlement ? `<div class="amount-per">RM ${perPerson}/person</div>` : ''}
+      <button class="btn-danger" onclick="removeExpense('${e.id}')">remove</button>
+    </div>
+  </div>`;
+}
+
+// ===== Scanner Panel =====
+function renderScannerPanel() {
+  const panel = document.getElementById('scanner-panel');
+  const dz = document.getElementById('drop-zone');
+  const progress = document.getElementById('scan-progress');
+  const resultForm = document.getElementById('scan-result-form');
+
+  if (state.scanning) {
+    dz.classList.add('hidden');
+    progress.classList.remove('hidden');
+    resultForm.classList.add('hidden');
+    resultForm.innerHTML = '';
+    return;
+  }
+
+  progress.classList.add('hidden');
+
+  if (state.scanResult) {
+    dz.classList.add('hidden');
+    resultForm.classList.remove('hidden');
+    resultForm.innerHTML = buildScanResultForm();
+  } else {
+    dz.classList.remove('hidden');
+    resultForm.classList.add('hidden');
+    resultForm.innerHTML = '';
+  }
+}
+
+function buildScanResultForm() {
+  const r = state.scanResult;
+  if (!state.members.length) return '<div class="notice warn">Add members first before scanning.</div>';
+
+  const memberOpts = state.members.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+  const catVal = CATS.find(c => c.toLowerCase().includes((r.category || '').toLowerCase())) || CATS[0];
+
+  let html = '';
+  if (r.error) html += '<div class="notice warn" style="margin-bottom:10px">Could not read receipt automatically. Fill in manually below.</div>';
+
+  if (state.scanImagePreview) {
+    html += `<img src="${state.scanImagePreview}" style="width:100%;height:120px;object-fit:cover;border-radius:8px;margin-bottom:10px;border:0.5px solid rgba(0,0,0,0.08)">`;
+  }
+
+  if (r.items && r.items.length) {
+    html += `<div class="extracted-items" style="margin-bottom:10px">
+      <div style="font-size:11px;color:#73726c;font-weight:500;margin-bottom:6px">EXTRACTED ITEMS</div>
+      ${r.items.map(it => `<div class="extracted-item"><span>${it.desc}</span><span style="font-family:'DM Mono',monospace">RM ${parseFloat(it.price || 0).toFixed(2)}</span></div>`).join('')}
+      <div class="extracted-item"><span>Total</span><span style="font-family:'DM Mono',monospace">RM ${parseFloat(r.total || 0).toFixed(2)}</span></div>
+    </div>`;
+  }
+
+  html += `<div class="form-grid">
+    <div class="form-row"><label class="form-label">Description</label><input id="exp-desc" class="input-field" value="${r.name || ''}"></div>
+    <div class="form-row"><label class="form-label">Amount (RM)</label><input id="exp-amount" class="input-field" type="number" step="0.01" value="${parseFloat(r.total || 0).toFixed(2)}"></div>
+  </div>
+  <div class="form-grid">
+    <div class="form-row"><label class="form-label">Paid by</label><select id="exp-payer" class="input-field">${memberOpts}</select></div>
+    <div class="form-row"><label class="form-label">Category</label><select id="exp-cat" class="input-field">${CATS.map(c => `<option value="${c}" ${c === catVal ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+  </div>
+  <div class="form-row"><label class="form-label">Split among</label>
+    <div class="split-checks">${state.members.map(m => `<label class="split-check-label"><input type="checkbox" name="split_${m.id}" value="${m.id}" checked> ${m.name}</label>`).join('')}</div>
+  </div>
+  <div class="panel-footer">
+    <button class="btn-primary" onclick="submitExpense(true)">Save with receipt 📎</button>
+    <button class="btn-outline" onclick="resetScanner()">Rescan</button>
+  </div>`;
+  return html;
+}
+
+function buildManualForm() {
+  const memberOpts = state.members.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+  if (!state.members.length) return '<div class="notice warn">Add members first.</div>';
+  return `<div class="form-grid">
+    <div class="form-row"><label class="form-label">Description</label><input id="exp-desc" class="input-field" placeholder="e.g. Dinner"></div>
+    <div class="form-row"><label class="form-label">Amount (RM)</label><input id="exp-amount" class="input-field" type="number" step="0.01" placeholder="0.00"></div>
+  </div>
+  <div class="form-grid">
+    <div class="form-row"><label class="form-label">Paid by</label><select id="exp-payer" class="input-field">${memberOpts}</select></div>
+    <div class="form-row"><label class="form-label">Category</label><select id="exp-cat" class="input-field">${CATS.map(c => `<option value="${c}">${c}</option>`).join('')}</select></div>
+  </div>
+  <div class="form-row"><label class="form-label">Split among</label>
+    <div class="split-checks">${state.members.map(m => `<label class="split-check-label"><input type="checkbox" name="split_${m.id}" value="${m.id}" checked> ${m.name}</label>`).join('')}</div>
+  </div>`;
+}
+
+// ===== Settle Tab =====
+function renderSettle() {
+  const settlements = computeSettlements();
+  const bal = computeBalances();
+
+  const settleEl = document.getElementById('settlements-list');
+  if (settlements.length === 0) {
+    settleEl.innerHTML = '<div class="empty-state">Everyone is settled up! 🎉</div>';
+  } else {
+    settleEl.innerHTML = settlements.map(t => `
+      <div class="settle-row">
+        <div class="settle-who">
+          <span class="pill pill-red">${t.from}</span>
+          <span style="font-size:12px;color:#73726c">owes</span>
+          <span class="pill pill-green">${t.to}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="settle-amount">${fmtMoney(t.amt)}</span>
+          <button class="btn-primary" style="font-size:12px;padding:5px 10px" onclick="markSettled('${t.fromId}','${t.toId}',${t.amt.toFixed(2)})">Mark paid</button>
+        </div>
+      </div>`).join('');
+  }
+
+  const balEl = document.getElementById('balances-list');
+  if (state.members.length === 0) {
+    balEl.innerHTML = '<div class="empty-state">No members yet.</div>';
+  } else {
+    balEl.innerHTML = state.members.map(m => {
+      const b = bal[m.id] || 0;
+      const av = avatarColor(m.name);
+      let badge = '';
+      if (Math.abs(b) < 0.01) badge = '<span class="pill pill-gray">settled</span>';
+      else if (b > 0) badge = `<span class="pill pill-green">gets back ${fmtMoney(b)}</span>`;
+      else badge = `<span class="pill pill-red">owes ${fmtMoney(b)}</span>`;
+      return `<div class="settle-row">
+        <div class="member-info">
+          <div class="avatar" style="background:${av.bg};color:${av.color}">${initials(m.name)}</div>
+          <span style="font-size:14px;font-weight:500">${m.name}</span>
+        </div>
+        ${badge}
+      </div>`;
+    }).join('');
+  }
+}
+
+// ===== Members Tab =====
+function renderMembers() {
+  const bal = computeBalances();
+  const el = document.getElementById('members-list');
+  if (state.members.length === 0) {
+    el.innerHTML = '<div class="empty-state">No members yet. Add people who share expenses.</div>';
+    return;
+  }
+  el.innerHTML = state.members.map(m => {
+    const b = bal[m.id] || 0;
+    const av = avatarColor(m.name);
+    const balText = Math.abs(b) < 0.01 ? 'settled' : b > 0 ? `gets back ${fmtMoney(b)}` : `owes ${fmtMoney(b)}`;
+    return `<div class="member-row">
+      <div class="member-info">
+        <div class="avatar" style="background:${av.bg};color:${av.color}">${initials(m.name)}</div>
+        <div>
+          <div class="member-name">${m.name}</div>
+          <div class="member-balance">${balText}</div>
+        </div>
+      </div>
+      <button class="btn-danger" onclick="removeMember('${m.id}')">Remove</button>
+    </div>`;
+  }).join('');
+}
+
+// ============================================================
+// Actions
+// ============================================================
+async function submitExpense(withReceipt) {
+  const desc = document.getElementById('exp-desc')?.value?.trim();
+  const amount = parseFloat(document.getElementById('exp-amount')?.value || '0');
+  const paidBy = document.getElementById('exp-payer')?.value;
+  const category = document.getElementById('exp-cat')?.value;
+  if (!desc || !amount || !paidBy) { alert('Please fill in description, amount, and payer.'); return; }
+
+  const checks = document.querySelectorAll('[name^="split_"]');
+  const splitees = [...checks].filter(c => c.checked).map(c => c.value);
+  if (!splitees.length) { alert('Select at least one person to split with.'); return; }
+
+  const perPerson = amount / splitees.length;
+  const splits = {};
+  splitees.forEach(id => splits[id] = perPerson);
+  const items = (state.scanResult && state.scanResult.items) || [];
+  const expId = uid();
+
+  state.expenses.unshift({ id: expId, desc, amount, paidBy, category, splits, items, date: new Date().toISOString() });
+
+  if (withReceipt && state.scanImageB64) {
+    const fileId = await uploadReceiptToDrive(expId, state.scanImageB64);
+    if (fileId) state.receiptFileIds[expId] = fileId;
+  }
+
+  resetScanner();
+  document.getElementById('scanner-panel').classList.add('hidden');
+  document.getElementById('manual-panel').classList.add('hidden');
+  await saveDataToDrive();
+  renderAll();
+}
+
+async function removeExpense(id) {
+  if (!confirm('Remove this expense?')) return;
+  state.expenses = state.expenses.filter(e => e.id !== id);
+  delete state.receiptFileIds[id];
+  await saveDataToDrive();
+  renderAll();
+}
+
+async function markSettled(fromId, toId, amt) {
+  const splits = {}; splits[fromId] = amt;
+  state.expenses.unshift({ id: uid(), desc: 'Settlement', amount: amt, paidBy: toId, category: '📦 Other', splits, date: new Date().toISOString(), isSettlement: true });
+  await saveDataToDrive();
+  renderAll();
+}
+
+async function addMember(name) {
+  if (!name.trim()) return;
+  state.members.push({ id: uid(), name: name.trim() });
+  await saveDataToDrive();
+  renderAll();
+}
+
+async function removeMember(id) {
+  const used = state.expenses.some(e => e.paidBy === id || Object.keys(e.splits || {}).includes(id));
+  if (used) { alert('Cannot remove — this member has recorded expenses.'); return; }
+  if (!confirm('Remove this member?')) return;
+  state.members = state.members.filter(m => m.id !== id);
+  await saveDataToDrive();
+  renderAll();
+}
+
+async function viewReceipt(expId) {
+  const fileId = state.receiptFileIds[expId];
+  const exp = state.expenses.find(e => e.id === expId);
+  const viewer = document.getElementById('receipt-viewer');
+  const title = document.getElementById('receipt-viewer-title');
+  const details = document.getElementById('receipt-viewer-details');
+  const imgEl = document.getElementById('receipt-viewer-img');
+
+  title.textContent = exp ? exp.desc : 'Receipt';
+  details.innerHTML = exp ? `
+    <div class="card" style="padding:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div style="font-weight:500;font-size:15px">${exp.desc}</div>
+          <div style="font-size:12px;color:#73726c">${exp.category || ''} · ${fmtDate(exp.date)}</div>
+        </div>
+        <div style="font-family:'DM Mono',monospace;font-size:18px;font-weight:600">${fmtMoney(exp.amount)}</div>
+      </div>
+      ${exp.items && exp.items.length ? `
+      <div class="divider"></div>
+      <div class="extracted-items">
+        <div style="font-size:11px;color:#73726c;font-weight:500;margin-bottom:6px">AI EXTRACTED ITEMS</div>
+        ${exp.items.map(it => `<div class="extracted-item"><span>${it.desc}</span><span style="font-family:'DM Mono',monospace">RM ${parseFloat(it.price || 0).toFixed(2)}</span></div>`).join('')}
+      </div>` : ''}
+    </div>` : '';
+
+  imgEl.innerHTML = '<div class="empty-state">Loading receipt from Google Drive...</div>';
+  viewer.classList.remove('hidden');
+  document.getElementById('tab-expenses').classList.add('hidden');
+
+  if (fileId) {
+    const url = await getReceiptUrl(fileId);
+    imgEl.innerHTML = `<img src="${url}" alt="Receipt" style="width:100%;border-radius:10px;border:0.5px solid rgba(0,0,0,0.08);margin-top:12px">`;
+  } else {
+    imgEl.innerHTML = '<div class="empty-state">Receipt image not found.</div>';
+  }
+}
+
+function closeReceipt() {
+  document.getElementById('receipt-viewer').classList.add('hidden');
+  document.getElementById('tab-expenses').classList.remove('hidden');
+}
+
+function resetScanner() {
+  state.scanResult = null;
+  state.scanImageB64 = null;
+  state.scanImagePreview = null;
+  state.scanning = false;
+}
+
+// ============================================================
+// UI helpers
+// ============================================================
+function showApp() {
+  document.getElementById('auth-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+}
+
+function showSync(msg) {
+  const bar = document.getElementById('sync-bar');
+  document.getElementById('sync-msg').textContent = msg;
+  bar.classList.remove('hidden');
+}
+
+function hideSync() {
+  document.getElementById('sync-bar').classList.add('hidden');
+}
+
+// ============================================================
+// Event Listeners
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+  initGoogle();
+
+  // Sign out
+  document.getElementById('signout-btn').addEventListener('click', signOut);
+
+  // Group name rename
+  document.getElementById('group-name-display').addEventListener('click', async () => {
+    const n = prompt('Group name:', state.groupName);
+    if (n && n.trim()) {
+      state.groupName = n.trim();
+      document.getElementById('group-name-display').textContent = state.groupName;
+      await saveDataToDrive();
+      renderStats();
+    }
+  });
+
+  // Tabs
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(tc => tc.classList.add('hidden'));
+      tab.classList.add('active');
+      document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
+    });
+  });
+
+  // Scan button
+  document.getElementById('scan-btn').addEventListener('click', () => {
+    resetScanner();
+    document.getElementById('manual-panel').classList.add('hidden');
+    const panel = document.getElementById('scanner-panel');
+    panel.classList.toggle('hidden');
+    renderScannerPanel();
+  });
+
+  // Manual button
+  document.getElementById('manual-btn').addEventListener('click', () => {
+    document.getElementById('scanner-panel').classList.add('hidden');
+    const panel = document.getElementById('manual-panel');
+    panel.classList.toggle('hidden');
+    document.getElementById('manual-form').innerHTML = buildManualForm();
+  });
+
+  // Cancel scan
+  document.getElementById('cancel-scan-btn').addEventListener('click', () => {
+    resetScanner();
+    document.getElementById('scanner-panel').classList.add('hidden');
+  });
+
+  // Cancel manual
+  document.getElementById('cancel-manual-btn').addEventListener('click', () => {
+    document.getElementById('manual-panel').classList.add('hidden');
+  });
+
+  // Save manual
+  document.getElementById('save-manual-btn').addEventListener('click', () => submitExpense(false));
+
+  // File input / drag-drop
+  const fileInput = document.getElementById('receipt-file');
+  fileInput.addEventListener('change', e => {
+    if (e.target.files[0]) handleImageFile(e.target.files[0]);
+  });
+  const dz = document.getElementById('drop-zone');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) handleImageFile(e.dataTransfer.files[0]);
+  });
+
+  // Add member
+  document.getElementById('add-member-btn').addEventListener('click', () => {
+    document.getElementById('add-member-panel').classList.toggle('hidden');
+    document.getElementById('new-member-input').focus();
+  });
+  document.getElementById('cancel-member-btn').addEventListener('click', () => {
+    document.getElementById('add-member-panel').classList.add('hidden');
+  });
+  document.getElementById('save-member-btn').addEventListener('click', () => {
+    const inp = document.getElementById('new-member-input');
+    if (inp.value.trim()) {
+      addMember(inp.value.trim());
+      inp.value = '';
+      document.getElementById('add-member-panel').classList.add('hidden');
+    }
+  });
+  document.getElementById('new-member-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('save-member-btn').click();
+  });
+
+  // Close receipt viewer
+  document.getElementById('close-receipt-btn').addEventListener('click', closeReceipt);
+});
+
+function handleImageFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const dataUrl = e.target.result;
+    state.scanImagePreview = dataUrl;
+    state.scanImageB64 = dataUrl.split(',')[1];
+    scanReceipt(state.scanImageB64);
+  };
+  reader.readAsDataURL(file);
+}
+
+// Expose globals for inline onclick handlers
+window.submitExpense = submitExpense;
+window.removeExpense = removeExpense;
+window.markSettled = markSettled;
+window.removeMember = removeMember;
+window.viewReceipt = viewReceipt;
+window.resetScanner = resetScanner;
